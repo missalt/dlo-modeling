@@ -1,401 +1,331 @@
 import numpy as np
 import mujoco
-# import mujoco.viewer
-import re
 import time
-import concurrent.futures
 import os
-import multiprocessing 
-import threading 
+import concurrent.futures
+import multiprocessing
+import threading
 
-# --- Simulation Parameters ---
+# --- Configuration ---
 XML_PATH = "rope_chain.xml"
-MIN_FORCE_MAG = 0.1  # Minimum force magnitude
-MAX_FORCE_MAG = 3.0  # Maximum force magnitude
-FORCE_STEPS = 200
-NUM_TRANSITIONS = 100  # Total number of transitions to collect (across all workers)
-NUM_ROLLOUTS = 20       # Number of parallel workers/rollouts
-SETTLE_TIME = 10.0
-SAVE_INTERVAL = 100   
-MONITOR_INTERVAL = 30 
-USE_VIEWER = False       # MUST be False for multiprocessing
+OUTPUT_FILENAME = "rope_trajectories.npz"
 
-FINAL_OUTPUT_FILENAME = "rope_state_action_next_state.npz"
-PARTIAL_FILENAME_TPL = "rope_data_part_{worker_id}.npz"
+# Process Configuration
+TOTAL_PROCESSES = 30
+TRAJECTORIES_PER_WORKER = 1000  
+RECORDING_STEPS = 10          # 1 Start + 8 Move + 1 End
 
+# Trajectory Settings
+MOVE_DURATION = 3.0          
+LIFT_DELTA_Z = 0.01          
+TRANSPORT_RADIUS = 0.25      
+MIN_SAFE_Z = 0.02            
 
-def get_link_ids(model, prefix="link_"):
-    """
-    Finds the body IDs for all bodies with a given prefix.
-    This is necessary because MuJoCo shuffles body IDs.
-    """
-    ids, names = [], []
+# Physics Settings
+TIMESTEP = 0.002             
+INITIAL_SETTLE_STEPS = 3000   # Long settle as requested
+BETWEEN_SETTLE_STEPS = 100    
+POST_DROP_SETTLE_TIME = 0.5  
+POST_DROP_STEPS = int(POST_DROP_SETTLE_TIME / TIMESTEP)
+
+# Fixed Physics Constants
+BASE_DAMPING = 0.05           
+BASE_GROUND_FRICTION = 1.0    
+
+def get_ids(model):
+    link_ids = []
+    weld_ids = []
     i = 0
     while True:
-        name = f"{prefix}{i}"
-        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
-        if bid == -1:
-            break
-        ids.append(bid)
-        names.append(name)
+        link_name = f"link_{i}"
+        weld_name = f"weld_{i}"
+        lid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, link_name)
+        wid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, weld_name)
+        if lid == -1: break
+        link_ids.append(lid)
+        weld_ids.append(wid)
         i += 1
-        if i > model.nbody:
-            break
-    if ids:
-        return np.array(ids, dtype=int), names
-        
-    # Fallback scan if names aren't contiguous (e.g., link_0, link_2)
-    cand = []
-    for b in range(model.nbody):
-        nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
-        m = re.match(rf"^{re.escape(prefix)}(\d+)$", nm)
-        if m:
-            cand.append((int(m.group(1)), b, nm))
-    if not cand:
-        raise RuntimeError(f"No bodies named like '{prefix}*' found.")
-    cand.sort(key=lambda x: x[0])
-    return np.array([b for _, b, _ in cand], dtype=int), [nm for _, _, nm in cand]
+    if not link_ids: raise RuntimeError("No links found.")
+    return np.array(link_ids, dtype=int), np.array(weld_ids, dtype=int)
 
-def save_data(filename, num_to_save, states, actions, next_states, link_names_arr, meta):
-    """Saves a slice of the collected data to an .npz file."""
-    print(f"\n--- Saving {num_to_save} transitions to {filename} ---")
-    np.savez_compressed(
-        filename,
-        states=states[:num_to_save],
-        actions=actions[:num_to_save],
-        next_states=next_states[:num_to_save],
-        link_names=link_names_arr,
-        meta=meta,
-    )
-    print(f"  states:      {states[:num_to_save].shape}")
-    print(f"  actions:     {actions[:num_to_save].shape}")
-    print(f"  next_states: {next_states[:num_to_save].shape}")
-    print("--- Save complete ---")
+def smooth_interp(p_start, p_end, steps):
+    t = np.linspace(0, 1, steps)
+    s = 0.5 * (1 - np.cos(t * np.pi))
+    return np.outer(1 - s, p_start) + np.outer(s, p_end)
 
-def monitor_throughput(global_count, count_lock, stop_event, interval_sec):
+def generate_low_lift_trajectory(start_pos, total_steps):
+    p0 = start_pos
+    p1 = p0 + np.array([0, 0, LIFT_DELTA_Z])
     
+    theta = np.random.uniform(0, 2 * np.pi)
+    r = np.random.uniform(0.05, TRANSPORT_RADIUS)
+    dx = r * np.cos(theta)
+    dy = r * np.sin(theta)
+    p2 = p1 + np.array([dx, dy, 0])
     
-    while not stop_event.is_set():
-        with count_lock:
-            if global_count.value > 0:
-                break 
-        
-        if stop_event.wait(timeout=0.2): 
-            return 
-            
-    if stop_event.is_set():
-        return 
+    target_z = max(MIN_SAFE_Z, p0[2]) 
+    p3 = np.array([p2[0], p2[1], target_z])
+    
+    steps_phase = total_steps // 3
+    remainder = total_steps - (steps_phase * 3)
+    
+    traj_1 = smooth_interp(p0, p1, steps_phase)
+    traj_2 = smooth_interp(p1, p2, steps_phase)
+    traj_3 = smooth_interp(p2, p3, steps_phase + remainder)
+    
+    return np.vstack([traj_1, traj_2, traj_3]), p3 - p0
 
-
-    last_time = time.perf_counter()
-    with count_lock:
-        last_count = global_count.value
-
-    while not stop_event.wait(timeout=interval_sec):
-        current_time = time.perf_counter()
-        
-        with count_lock:
-            current_count = global_count.value
-            
-        elapsed_time = current_time - last_time
-        delta_transitions = current_count - last_count
-        
-        if elapsed_time > 0:
-            tps = delta_transitions / elapsed_time
-        else:
-            tps = 0.0
-            
-
-        
-        last_time = current_time
-        last_count = current_count
-        
-
-def run_rollout_worker(worker_id, transitions_for_this_worker, meta_info, 
-                     link_names_arr, print_lock, 
-                     global_transition_count, global_count_lock): 
+def get_worker_config(worker_id):
     """
-    This function is executed by each parallel worker.
-    It runs a simulation segment and saves its results to a partial file.
+    Assigns physics parameters based on worker ID.
+    Total: 30 Workers.
     """
     
-    # Each worker must load its own model and data
+    # Group A: Workers 0-24 (25 Workers) -> Vary Stiffness
+    # Log-space gives more values near 0.001-0.01 and fewer near 0.5
+    stiff_range = np.geomspace(0.001, 0.5, 25)
+    
+    # Group B: Workers 25-29 (5 Workers) -> Vary Friction (0.5 or 1.0)
+    # Alternating pattern: 0.5, 1.0, 0.5, 1.0, 0.5
+    fric_pattern = [0.5, 1.0, 0.5, 1.0, 0.5]
+
+    if worker_id < 25:
+        # Vary Stiffness, Fixed Friction (0.8)
+        config = {
+            'stiffness': stiff_range[worker_id],
+            'rope_friction': 0.8,
+            'damping': BASE_DAMPING,
+            'ground_friction': BASE_GROUND_FRICTION
+        }
+    else:
+        # Fixed Stiffness (0.005), Vary Friction
+        idx = worker_id - 25
+        config = {
+            'stiffness': 0.005,
+            'rope_friction': fric_pattern[idx],
+            'damping': BASE_DAMPING,
+            'ground_friction': BASE_GROUND_FRICTION
+        }
+        
+    return config
+
+def worker_routine(worker_id, num_trajectories, global_counter, counter_lock):
+    np.random.seed(worker_id * int(time.time()) % 123456789)
+    
+    # 1. Setup Model
     m = mujoco.MjModel.from_xml_path(XML_PATH)
     d = mujoco.MjData(m)
-    link_ids, _ = get_link_ids(m)
-    L = len(link_ids)
+    m.opt.timestep = TIMESTEP
+    
+    # 2. Apply Physics
+    config = get_worker_config(worker_id)
+    
+    for i in range(1, 70):
+        j_name = f"j_{i}"
+        j_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, j_name)
+        if j_id != -1:
+            m.jnt_stiffness[j_id] = config['stiffness']
+            dof_adr = m.jnt_dofadr[j_id]
+            m.dof_damping[dof_adr:dof_adr+3] = config['damping']
 
-    # Initialize local data arrays
-    states = np.zeros((transitions_for_this_worker, L, 3), dtype=np.float32)
-    actions = np.zeros((transitions_for_this_worker, 4), dtype=np.float32)
-    next_states = np.zeros((transitions_for_this_worker, L, 3), dtype=np.float32)
+    g_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+    if g_id != -1:
+        m.geom_friction[g_id, 0] = config['ground_friction']
+        
+    for g_id in range(m.ngeom):
+        g_type = m.geom_type[g_id]
+        if g_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            m.geom_friction[g_id, 0] = config['rope_friction']
 
-    # Each worker should have a different random seed
-    seed = (os.getpid() * int(time.time() * 1000) + worker_id) % (2**32)
-    np.random.seed(seed)
+    # 3. Storage
+    link_ids, weld_ids = get_ids(m)
+    num_links = len(link_ids)
+    
+    dataset_states = np.zeros((num_trajectories, RECORDING_STEPS, num_links, 3), dtype=np.float32)
+    dataset_hand   = np.zeros((num_trajectories, RECORDING_STEPS, 4), dtype=np.float32)
+    dataset_params = np.zeros((num_trajectories, 4), dtype=np.float32)
+    
+    sim_steps_total = int(MOVE_DURATION / TIMESTEP)
+    intermediate_indices = np.linspace(0, sim_steps_total - 1, 8, dtype=int)
 
-    def step():
+    # 4. Loop
+    mujoco.mj_resetData(m, d)
+    d.eq_active[:] = 0
+    
+    # Initial Long Settle
+    for _ in range(INITIAL_SETTLE_STEPS):
         mujoco.mj_step(m, d)
 
-    # Settle simulation
-    for _ in range(int(SETTLE_TIME / m.opt.timestep)):
-        step()
-
-    last_log_time = time.perf_counter()
-    num_done_in_batch = 0 
-
-    # --- Run simulation loop ---
-    for i in range(transitions_for_this_worker):
-        # 1. Record current state (S_t)
-        states[i] = d.xpos[link_ids, :].astype(np.float32)
-
-        # 2. Choose and record action (A_t)
-        li = np.random.randint(0, L)
-        bid = link_ids[li]
+    for t_idx in range(num_trajectories):
+        dataset_params[t_idx] = [
+            config['stiffness'], 
+            config['rope_friction'], 
+            config['damping'], 
+            config['ground_friction']
+        ]
         
-        fvec = np.zeros(3, dtype=np.float32)
-        axis_idx = np.random.randint(0, 3)
-        sign = 1.0 if np.random.rand() < 0.5 else -1.0
-        magnitude = np.random.uniform(MIN_FORCE_MAG, MAX_FORCE_MAG)
-        fvec[axis_idx] = sign * magnitude
-
-        actions[i, :3] = fvec
-        actions[i,  3] = float(li)
+        rec_count = 0
         
-        # 3. Apply action
-        for _ in range(FORCE_STEPS):
-            d.xfrc_applied[bid, :3] = fvec
-            step()
-        d.xfrc_applied[bid, :] = 0.0
+        # Grab
+        target_idx = np.random.randint(0, num_links)
+        lid = link_ids[target_idx]
+        wid = weld_ids[target_idx]
 
-        # 4. Record the resulting next state (S_{t+1})
-        next_states[i] = d.xpos[link_ids, :].astype(np.float32)
-
-        num_done_in_batch += 1 # <-- NEU: Zähle jede fertige Transition
-
-        if (i + 1) % SAVE_INTERVAL == 0:
-            current_time = time.perf_counter()
-            elapsed_for_interval = current_time - last_log_time
-            
-            time_per_trans_s = elapsed_for_interval / SAVE_INTERVAL 
-
-            with print_lock:
-                print(f"[Worker {worker_id}] Progress: {i + 1}/{transitions_for_this_worker} "
-                      f"| Avg: {time_per_trans_s:.4f} s/trans")
-            
-            with global_count_lock:
-                global_transition_count.value += num_done_in_batch
-            
-            num_done_in_batch = 0 
-            last_log_time = current_time 
-
-    if num_done_in_batch > 0:
-        with global_count_lock:
-            global_transition_count.value += num_done_in_batch
+        d.mocap_pos[0] = d.xpos[lid]
+        d.mocap_quat[0] = d.xquat[lid]
+        mujoco.mj_step(m, d) 
         
-    # --- Save partial data ---
-    output_filename = PARTIAL_FILENAME_TPL.format(worker_id=worker_id)
-    with print_lock:
-        save_data(output_filename, transitions_for_this_worker, states, actions, 
-                  next_states, link_names_arr, meta_info)
+        m.eq_solref[wid] = [0.01, 1.0] 
+        d.eq_active[wid] = 1
+
+        # Plan
+        start_pos = d.mocap_pos[0].copy()
+        traj_points, _ = generate_low_lift_trajectory(start_pos, sim_steps_total)
+        
+        # STEP 0: Record Start
+        dataset_states[t_idx, rec_count] = d.xpos[link_ids].astype(np.float32)
+        h_pos = d.mocap_pos[0].astype(np.float32)
+        dataset_hand[t_idx, rec_count] = [h_pos[0], h_pos[1], h_pos[2], float(target_idx)]
+        rec_count += 1
+
+        # STEPS 1-8: Move & Record
+        for step in range(sim_steps_total):
+            d.mocap_pos[0] = traj_points[step]
+            mujoco.mj_step(m, d)
+            
+            if step in intermediate_indices:
+                if rec_count < RECORDING_STEPS - 1:
+                    dataset_states[t_idx, rec_count] = d.xpos[link_ids].astype(np.float32)
+                    h_pos = d.mocap_pos[0].astype(np.float32)
+                    dataset_hand[t_idx, rec_count] = [h_pos[0], h_pos[1], h_pos[2], float(target_idx)]
+                    rec_count += 1
+
+        # Release
+        d.eq_active[wid] = 0 
+        d.mocap_pos[0] = [0, 0, 2.0]
+        
+        # Post-Drop Settle
+        for _ in range(POST_DROP_STEPS):
+            mujoco.mj_step(m, d)
+
+        # STEP 9: Record Settled
+        dataset_states[t_idx, RECORDING_STEPS - 1] = d.xpos[link_ids].astype(np.float32)
+        dataset_hand[t_idx, RECORDING_STEPS - 1] = [0.0, 0.0, 2.0, float(target_idx)]
+
+        # Global Counter
+        with counter_lock:
+            global_counter.value += 1
+            
+        # Between Episode Settle
+        for _ in range(BETWEEN_SETTLE_STEPS):
+            mujoco.mj_step(m, d)
+
+    partial_filename = f"partial_data_{worker_id}.npz"
+    np.savez_compressed(partial_filename, states=dataset_states, hand=dataset_hand, configs=dataset_params)
+    return partial_filename
+
+def monitor_throughput(global_counter, counter_lock, stop_event, total_target):
+    print("\n--- Waiting for Initial Settle (3000 steps)... ---")
+    start_time = None
     
-    return output_filename, transitions_for_this_worker
+    while not stop_event.is_set():
+        with counter_lock:
+            val = global_counter.value
+        
+        if val > 0:
+            start_time = time.time()
+            print("--- First trajectory finished. Tracking Global Speed. ---")
+            break
+        time.sleep(0.1)
+
+    if start_time is None: return
+
+    while not stop_event.is_set():
+        time.sleep(2.0)
+        current_time = time.time()
+        with counter_lock:
+            current_count = global_counter.value
+            
+        elapsed = current_time - start_time
+        if elapsed > 1.0:
+            tps = current_count / elapsed
+            print(f"Progress: {current_count}/{total_target} | Global Trajectories/Sec: {tps:.2f}")
+        
+        if current_count >= total_target:
+            break
 
 def main():
-    """
-    Main function to ORCHESTRATE the simulation.
-    It distributes work to parallel processes, loads existing data,
-    and appends new data to the final file.
-    """
-    if USE_VIEWER:
-        print("ERROR: USE_VIEWER must be set to False to run in parallel.")
-        print("Parallel workers cannot (and should not) launch GUI viewers.")
+    if not os.path.exists(XML_PATH):
+        print(f"Error: {XML_PATH} not found.")
         return
 
-    # --- Load model once in main process to get metadata ---
-    try:
-        m_main = mujoco.MjModel.from_xml_path(XML_PATH)
-        _, link_names = get_link_ids(m_main)
-        link_names_arr = np.array(link_names, dtype=object)
-    except Exception as e:
-        print(f"Error loading XML {XML_PATH}: {e}")
-        return
+    total_target = TOTAL_PROCESSES * TRAJECTORIES_PER_WORKER
+    print(f"Starting Collection:")
+    print(f"  Processes: {TOTAL_PROCESSES}")
+    print(f"  Total Target: {total_target} trajectories")
 
-    meta_info = dict(
-        xml=XML_PATH,
-        timestep=m_main.opt.timestep,
-        min_force_mag=MIN_FORCE_MAG,
-        max_force_mag=MAX_FORCE_MAG,
-        force_steps=FORCE_STEPS,
-        settle_time=SETTLE_TIME,
-        num_rollouts=NUM_ROLLOUTS,
+    manager = multiprocessing.Manager()
+    global_counter = manager.Value('i', 0)
+    counter_lock = manager.Lock()
+    stop_event = threading.Event()
+
+    monitor_thread = threading.Thread(
+        target=monitor_throughput, 
+        args=(global_counter, counter_lock, stop_event, total_target)
     )
-    
-    # --- Distribute work ---
-    base_transitions = NUM_TRANSITIONS // NUM_ROLLOUTS
-    remainder = NUM_TRANSITIONS % NUM_ROLLOUTS
-    transitions_per_worker = [base_transitions] * NUM_ROLLOUTS
-    for i in range(remainder):
-        transitions_per_worker[i] += 1
-        
-    print(f"Starting {NUM_ROLLOUTS} parallel workers...")
-    print(f"Total NEW transitions to collect this run: {NUM_TRANSITIONS}")
-    print(f"Work distribution: {transitions_per_worker}")
-    
-    global_start_time = time.perf_counter()
-    partial_files = []
-    
-    with multiprocessing.Manager() as manager:
-        print_lock = manager.Lock() 
-        global_transition_count = manager.Value('i', 0) 
-        global_count_lock = manager.Lock() 
-        stop_event = manager.Event() 
+    monitor_thread.start()
 
-        monitor_thread = threading.Thread(
-            target=monitor_throughput,
-            args=(global_transition_count, global_count_lock, stop_event, MONITOR_INTERVAL),
-            daemon=True 
+    start_time_main = time.time()
+    temp_files = []
+
+    print("Launching Process Pool...")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=TOTAL_PROCESSES) as executor:
+        futures = []
+        for i in range(TOTAL_PROCESSES):
+            futures.append(executor.submit(
+                worker_routine, i, TRAJECTORIES_PER_WORKER, global_counter, counter_lock
+            ))
+        
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                fname = future.result()
+                temp_files.append(fname)
+            except Exception as e:
+                print(f"Worker Exception: {e}")
+
+    stop_event.set()
+    monitor_thread.join()
+
+    print(f"\nMerging files...")
+    all_states, all_hands, all_configs = [], [], []
+    
+    for fname in temp_files:
+        if os.path.exists(fname):
+            with np.load(fname) as d:
+                all_states.append(d['states'])
+                all_hands.append(d['hand'])
+                all_configs.append(d['configs'])
+            os.remove(fname)
+
+    if all_states:
+        final_states = np.concatenate(all_states, axis=0)
+        final_hands = np.concatenate(all_hands, axis=0)
+        final_configs = np.concatenate(all_configs, axis=0)
+        
+        print(f"Saving to {OUTPUT_FILENAME}")
+        print(f"States:  {final_states.shape}")
+        print(f"Configs: {final_configs.shape} (stiff, fric_rope, damp, fric_ground)")
+        
+        np.savez_compressed(
+            OUTPUT_FILENAME, 
+            states=final_states, 
+            hand_traj=final_hands,
+            configs=final_configs
         )
-        monitor_thread.start()
-        
-        # --- Launch parallel workers ---
-        with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ROLLOUTS) as executor:
-            futures = []
-            for i in range(NUM_ROLLOUTS):
-                n_tasks = transitions_per_worker[i]
-                if n_tasks > 0:
-                    print(f"  Submitting worker {i} for {n_tasks} transitions.")
-                    futures.append(
-                        executor.submit(
-                            run_rollout_worker, 
-                            i, 
-                            n_tasks, 
-                            meta_info, 
-                            link_names_arr,
-                            print_lock,
-                            global_transition_count, 
-                            global_count_lock     
-                        )
-                    )
-
-            # Wait for results
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    filename, num_done = future.result()
-                    partial_files.append(filename)
-                except Exception as e:
-                    print(f"A worker failed: {e}")
-
-        print("\nAll workers finished. Stopping monitor thread...")
-        stop_event.set()
-        monitor_thread.join(timeout=2.0) 
-
-    total_time = time.perf_counter() - global_start_time
-    print(f"Workers and monitor finished in {total_time:.2f}s.")
-
-    if not partial_files:
-        print("No new data was collected. Exiting.")
-        return
-
-    # --- Concatenate results from *this run* ---
-    print(f"Concatenating {len(partial_files)} partial files from this run...")
-    all_states_new, all_actions_new, all_next_states_new = [], [], []
-    total_saved_transitions_this_run = 0
-
-    partial_files.sort() 
-
-    for filename in partial_files:
-        try:
-            with np.load(filename) as data:
-                all_states_new.append(data['states'])
-                all_actions_new.append(data['actions'])
-                all_next_states_new.append(data['next_states'])
-                total_saved_transitions_this_run += len(data['states'])
-        except Exception as e:
-            print(f"Error loading {filename}: {e}. Skipping...")
-        finally:
-            # Clean up partial file
-            if os.path.exists(filename):
-                os.remove(filename)
-                print(f"  Removed temporary file: {filename}")
-
-    if total_saved_transitions_this_run == 0:
-        print("Concatenation failed or no new data was loaded. Final file not saved.")
-        return
-
-    # Kombiniere alle NEUEN Daten
-    new_states = np.concatenate(all_states_new, axis=0)
-    new_actions = np.concatenate(all_actions_new, axis=0)
-    new_next_states = np.concatenate(all_next_states_new, axis=0)
-
-    
-    all_final_states = []
-    all_final_actions = []
-    all_final_next_states = []
-    num_old_transitions = 0
-
-    if os.path.exists(FINAL_OUTPUT_FILENAME):
-        print(f"\nFound existing file: {FINAL_OUTPUT_FILENAME}. Loading to append...")
-        try:
-            with np.load(FINAL_OUTPUT_FILENAME, allow_pickle=True) as old_data:
-                all_final_states.insert(0, old_data['states'])
-                all_final_actions.insert(0, old_data['actions'])
-                all_final_next_states.insert(0, old_data['next_states'])
-                
-                num_old_transitions = len(old_data['states'])
-                print(f"  Loaded {num_old_transitions:,} existing transitions.")
-                
-                if 'meta' in old_data:
-                    old_meta = old_data['meta'].item() 
-                    if (old_meta.get('force_steps') != meta_info.get('force_steps') or
-                        old_meta.get('timestep') != meta_info.get('timestep')):
-                        print("\n" + "="*50)
-                        print(f"  WARNING: METADATA MISMATCH!")
-                        print(f"  Old meta: {old_meta.get('force_steps')} force_steps, {old_meta.get('timestep')} ts")
-                        print(f"  New meta: {meta_info.get('force_steps')} force_steps, {meta_info.get('timestep')} ts")
-                        print(f"  Appending data may lead to an inconsistent dataset.")
-                        print("="*50 + "\n")
-                else:
-                     print("  Warning: Old file contains no metadata for comparison.")
-                         
-        except Exception as e:
-            print(f"  Error loading old file '{FINAL_OUTPUT_FILENAME}': {e}.")
-            print("  This is often a pickle error. If so, the fix was unsuccessful.")
-            print("  Will overwrite with only new data.")
-            all_final_states, all_final_actions, all_final_next_states = [], [], []
-
-    all_final_states.append(new_states)
-    all_final_actions.append(new_actions)
-    all_final_next_states.append(new_next_states)
-
-    final_states_to_save = np.concatenate(all_final_states, axis=0)
-    final_actions_to_save = np.concatenate(all_final_actions, axis=0)
-    final_next_states_to_save = np.concatenate(all_final_next_states, axis=0)
-    total_transitions_to_save = len(final_states_to_save)
-
-
-    # --- Final Save ---
-    print("\nPerforming final save...")
-    print(f"  New transitions this run: {total_saved_transitions_this_run:,}")
-    print(f"  Total transitions (old + new): {total_transitions_to_save:,}")
-    
-    save_data(FINAL_OUTPUT_FILENAME, total_transitions_to_save, final_states_to_save, 
-              final_actions_to_save, final_next_states_to_save, link_names_arr, meta_info)
-    
-    
-    if total_saved_transitions_this_run > 0:
-        overall_tps = total_saved_transitions_this_run / total_time
-        avg_time_per_trans_s = total_time / total_saved_transitions_this_run
-        
-        print(f"\n  Stats for THIS RUN ({total_saved_transitions_this_run} transitions):")
-        print(f"    Total Runtime: {total_time:.2f}s")
-        print(f"    Avg. Time/Transition: {avg_time_per_trans_s * 1000:.4f} ms")
-        print(f"    Avg. Throughput (Overall): {overall_tps:.2f} trans/sec")
+        print(f"Total Time: {time.time() - start_time_main:.2f}s")
     else:
-        print(f"  Final Stats: No transitions recorded this run.")
-        print(f"    Total Runtime: {total_time:.2f}s")
-    print("=================================================")
+        print("No data collected.")
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support() 
+    multiprocessing.freeze_support()
     main()
