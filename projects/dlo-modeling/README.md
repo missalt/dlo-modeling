@@ -234,3 +234,5 @@ Install all required packages using the provided `requirements.txt` file:
 ```bash
 pip install -r requirements.txt
 ```
+
+Colab with experiments can be found at: https://colab.research.google.com/drive/1xv7Lnysixhb6aEGS7ll2g7AECHEES3U9?usp=sharing
